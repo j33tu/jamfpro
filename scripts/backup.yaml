@@ -1,0 +1,270 @@
+name: Deploy Printer to Jamf Pro (GitOps)
+
+on:
+  push:
+    branches:
+      - code-dev
+      - code-main
+
+jobs:
+  parse_config:
+    name: "Task 1: Parse Printer Configuration"
+    runs-on: macos-latest
+    outputs:
+      printer_name: ${{ steps.parse.outputs.printer_name }}
+      printer_ip: ${{ steps.parse.outputs.printer_ip }}
+      driver_url: ${{ steps.parse.outputs.driver_url }}
+      category: ${{ steps.parse.outputs.category }}
+      make_default: ${{ steps.parse.outputs.make_default }}
+      target_group: ${{ steps.parse.outputs.target_group }}
+      instance_type: ${{ steps.parse.outputs.instance_type }}
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Parse & Validate JSON
+        id: parse
+        run: |
+          CONFIG_FILE="printers/new-printer.json"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Error: $CONFIG_FILE not found!" && exit 1
+          fi
+
+          echo "printer_name=$(jq -r '.printer_name' $CONFIG_FILE)" >> $GITHUB_OUTPUT
+          echo "printer_ip=$(jq -r '.printer_ip' $CONFIG_FILE)" >> $GITHUB_OUTPUT
+          echo "driver_url=$(jq -r '.driver_url' $CONFIG_FILE)" >> $GITHUB_OUTPUT
+          echo "category=$(jq -r '.category' $CONFIG_FILE)" >> $GITHUB_OUTPUT
+          echo "make_default=$(jq -r '.make_default' $CONFIG_FILE)" >> $GITHUB_OUTPUT
+
+          if [ "${{ github.ref }}" == "refs/heads/code-main" ]; then
+            echo "target_group=$(jq -r '.prod_target_group' $CONFIG_FILE)" >> $GITHUB_OUTPUT
+            echo "instance_type=PROD" >> $GITHUB_OUTPUT
+          else
+            echo "target_group=$(jq -r '.dev_target_group' $CONFIG_FILE)" >> $GITHUB_OUTPUT
+            echo "instance_type=DEV" >> $GITHUB_OUTPUT
+          fi
+
+  download_driver:
+    name: "Task 2: Download Driver Payload"
+    needs: parse_config
+    runs-on: macos-latest
+    steps:
+      - name: Download Driver Binary
+        run: |
+          echo "Downloading payload from: ${{ needs.parse_config.outputs.driver_url }}"
+
+          if ! curl -f -sSL \
+            -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept-Language: en-US,en;q=0.9" \
+            -H "Referer: https://www.support.xerox.com/" \
+            -b "agree=true; xerox_eula_accepted=true; license_agreed=true" \
+            "${{ needs.parse_config.outputs.driver_url }}" -o downloaded_driver; then
+              echo "Error: Failed to fetch driver. Check if URL is valid (HTTP 404/403)." && exit 1
+          fi
+
+          FILE_TYPE=$(file downloaded_driver)
+          if [[ "$FILE_TYPE" == *"HTML document"* ]] || [[ "$FILE_TYPE" == *"ASCII text"* ]]; then
+            echo "Error: Server returned an HTML page instead of binary installer!"
+            head -n 20 downloaded_driver
+            exit 1
+          fi
+
+      - name: Upload Raw Payload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-driver-payload
+          path: downloaded_driver
+
+  extract_ppd:
+    name: "Task 3: Extract PPD & Prepare PKG"
+    needs: [parse_config, download_driver]
+    runs-on: macos-latest
+    outputs:
+      ppd_found: ${{ steps.ppd.outputs.ppd_found }}
+    steps:
+      - name: Download Raw Payload Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-driver-payload
+
+      - name: Convert / Unpack Payload
+        run: |
+          FILE_TYPE=$(file downloaded_driver)
+
+          if [[ "$FILE_TYPE" == *"zlib compressed"* ]] || [[ "${{ needs.parse_config.outputs.driver_url }}" == *.dmg ]]; then
+            echo "Mounting DMG disk image..."
+            mv downloaded_driver driver.dmg
+            MOUNT_DIR=$(hdiutil attach driver.dmg -nobrowse | grep /Volumes | awk -F'\t' '{print $NF}')
+            
+            PKG_INSIDE=$(find "$MOUNT_DIR" -maxdepth 2 -name "*.pkg" | head -n 1)
+            if [ -z "$PKG_INSIDE" ]; then
+              echo "Error: No .pkg file found in DMG!"
+              hdiutil detach "$MOUNT_DIR"
+              exit 1
+            fi
+            
+            cp "$PKG_INSIDE" ./driver.pkg
+            hdiutil detach "$MOUNT_DIR"
+          else
+            echo "Detected direct PKG payload."
+            mv downloaded_driver driver.pkg
+          fi
+
+      - name: Install PKG, Map Printer Queue & Extract PPD
+        id: ppd
+        run: |
+          echo "Installing PKG on runner..."
+          sudo installer -pkg ./driver.pkg -target /
+
+          echo "Searching for installed driver template/PPD..."
+          DRIVER_PPD=$(find /Library/Printers/PPDs/Contents/Resources /usr/share/cups/model -name "*.gz" -o -name "*.ppd" 2>/dev/null | grep -i "B1025\|B1022\|Xerox" | head -n 1)
+
+          if [ -z "$DRIVER_PPD" ]; then
+            echo "Warning: Specific driver template not found, falling back to top PPD file..."
+            DRIVER_PPD=$(find /Library/Printers/PPDs/Contents/Resources -type f | head -n 1)
+          fi
+
+          if [ -z "$DRIVER_PPD" ]; then
+            echo "Error: No driver template found after installing PKG!" && exit 1
+          fi
+
+          echo "Found driver template at: $DRIVER_PPD"
+
+          TEMP_QUEUE="Temp_Jamf_Printer"
+
+          echo "Mapping printer queue on runner via lpadmin..."
+          sudo lpadmin -p "$TEMP_QUEUE" \
+            -E \
+            -v "lpd://${{ needs.parse_config.outputs.printer_ip }}" \
+            -m "$DRIVER_PPD"
+
+          GENERATED_PPD="/etc/cups/ppd/${TEMP_QUEUE}.ppd"
+
+          if [ ! -f "$GENERATED_PPD" ]; then
+            echo "Error: CUPS did not generate $GENERATED_PPD after mapping!" && exit 1
+          fi
+
+          echo "Successfully generated and mapped PPD at: $GENERATED_PPD"
+
+          sudo cp "$GENERATED_PPD" ./printer.ppd
+          sudo chmod 644 ./printer.ppd
+
+          sudo lpadmin -x "$TEMP_QUEUE"
+
+          echo "ppd_found=true" >> $GITHUB_OUTPUT
+
+      - name: Upload Processed Driver Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-driver-package
+          path: |
+            driver.pkg
+            printer.ppd
+
+  deploy_jamf:
+    name: "Task 4: Deploy to Jamf Pro"
+    needs: [parse_config, extract_ppd]
+    runs-on: macos-latest
+    environment: ${{ github.ref == 'refs/heads/code-main' && 'production' || 'development' }}
+    steps:
+      - name: Download Processed Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: processed-driver-package
+
+      - name: Authenticate with Jamf Pro API
+        id: jamf_auth
+        env:
+          JAMF_URL: ${{ secrets.JAMF_URL }}
+          CLIENT_ID: ${{ secrets.JAMF_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.JAMF_CLIENT_SECRET }}
+        run: |
+          echo "Authenticating with Jamf Pro (${{ needs.parse_config.outputs.instance_type }})..."
+          TOKEN=$(curl -s -X POST "$JAMF_URL/api/oauth/token" \
+            -u "$CLIENT_ID:$CLIENT_SECRET" \
+            -d "grant_type=client_credentials" | jq -r '.access_token')
+
+          if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
+            echo "Authentication failed! Verify secrets." && exit 1
+          fi
+
+          echo "JAMF_TOKEN=$TOKEN" >> $GITHUB_ENV
+
+      - name: Upload Package to Jamf Pro
+        env:
+          JAMF_URL: ${{ secrets.JAMF_URL }}
+        run: |
+          curl -s -X POST "$JAMF_URL/api/v1/packages" \
+            -H "Authorization: Bearer $JAMF_TOKEN" \
+            -F "file=@driver.pkg"
+
+      - name: Create Printer Object
+        env:
+          JAMF_URL: ${{ secrets.JAMF_URL }}
+        run: |
+          PPD_CONTENT=$(cat ./printer.ppd | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+
+          PRINTER_NAME_SUFFIX="${{ needs.parse_config.outputs.printer_name }}"
+          if [ "${{ needs.parse_config.outputs.instance_type }}" == "DEV" ]; then
+            PRINTER_NAME_SUFFIX="${{ needs.parse_config.outputs.printer_name }} [DEV]"
+          fi
+
+          PRINTER_XML="<printer>
+            <name>$PRINTER_NAME_SUFFIX</name>
+            <category>${{ needs.parse_config.outputs.category }}</category>
+            <uri>lpd://${{ needs.parse_config.outputs.printer_ip }}</uri>
+            <ppd_contents>$PPD_CONTENT</ppd_contents>
+          </printer>"
+
+          curl -s -X POST "$JAMF_URL/JSSResource/printers/id/0" \
+            -H "Authorization: Bearer $JAMF_TOKEN" \
+            -H "Content-Type: application/xml" \
+            -d "$PRINTER_XML"
+
+      - name: Create Deployment Policy
+        env:
+          JAMF_URL: ${{ secrets.JAMF_URL }}
+        run: |
+          POLICY_NAME="Install Printer - ${{ needs.parse_config.outputs.printer_name }}"
+          PRINTER_REF_NAME="${{ needs.parse_config.outputs.printer_name }}"
+
+          if [ "${{ needs.parse_config.outputs.instance_type }}" == "DEV" ]; then
+            POLICY_NAME="Install Printer - ${{ needs.parse_config.outputs.printer_name }} [DEV]"
+            PRINTER_REF_NAME="${{ needs.parse_config.outputs.printer_name }} [DEV]"
+          fi
+
+          POLICY_XML="<policy>
+            <general>
+              <name>$POLICY_NAME</name>
+              <enabled>true</enabled>
+              <trigger_checkin>true</trigger_checkin>
+              <frequency>Once per computer</frequency>
+            </general>
+            <scope>
+              <computer_groups>
+                <computer_group>
+                  <name>${{ needs.parse_config.outputs.target_group }}</name>
+                </computer_group>
+              </computer_groups>
+            </scope>
+            <package_configuration>
+              <packages>
+                <package>
+                  <name>driver.pkg</name>
+                  <action>Install</action>
+                </package>
+              </packages>
+            </package_configuration>
+            <printers>
+              <printer>
+                <name>$PRINTER_REF_NAME</name>
+                <action>install</action>
+                <make_default>${{ needs.parse_config.outputs.make_default }}</make_default>
+              </printer>
+            </printers>
+          </policy>"
+
+          curl -s -X POST "$JAMF_URL/JSSResource/policies/id/0" \
+            -H "Authorization: Bearer $JAMF_TOKEN" \
+            -H "Content-Type: application/xml" \
+            -d "$POLICY_XML"
