@@ -1,7 +1,7 @@
 {
     "printer_name": "Xerox-B1025-Office",
     "printer_ip": "192.168.1.120",
-    "driver_url": "https://download.support.xerox.com/pub/drivers/B1022_B1025/macOS10_13/pt_BR/Xerox_B1022_B1025_Print_Driver_3.3.0.dmg",
+    "driver_url": "https://www.support.xerox.com/en-ca/product/xerox-b1022-b1025-multifunction-printer/downloads?platform=macos+26+-+Tahoe&category=&language=en&attributeId=",
     "category": "Infrastructure",
     "make_default": false,
     "dev_target_group": "Testing-Macs-Dev",
