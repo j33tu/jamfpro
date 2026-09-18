@@ -44,10 +44,12 @@ jobs:
         run: |
           echo "Downloading driver payload from $DRIVER_URL..."
 
-          # Download using custom User-Agent and headers to bypass vendor CDN landing pages
+          # Download using Chrome User-Agent, Xerox Referer, and Terms Cookie to bypass CDN blocks
           curl -sSL \
             -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
             -H "Accept-Language: en-US,en;q=0.9" \
+            -H "Referer: https://www.support.xerox.com/" \
+            -b "agree=true; xerox_eula_accepted=true; license_agreed=true" \
             "$DRIVER_URL" -o downloaded_driver
 
           FILE_TYPE=$(file downloaded_driver)
@@ -55,7 +57,8 @@ jobs:
           # Validate if the download returned HTML instead of a binary file
           if [[ "$FILE_TYPE" == *"HTML document"* ]] || [[ "$FILE_TYPE" == *"ASCII text"* ]]; then
             echo "Error: Downloaded file is an HTML landing page instead of a binary installer!"
-            echo "Ensure driver_url in printers/new-printer.json points directly to the .dmg or .pkg payload."
+            echo "Inspecting preview of downloaded payload:"
+            head -n 20 downloaded_driver
             exit 1
           fi
 
