@@ -44,20 +44,23 @@ jobs:
         run: |
           echo "Downloading driver payload from $DRIVER_URL..."
 
-          # Download using Chrome User-Agent, Xerox Referer, and Terms Cookie to bypass CDN blocks
-          curl -sSL \
+          # Download using Chrome User-Agent, Xerox Referer, Terms Cookie, and --fail to catch HTTP 404/403
+          if ! curl -f -sSL \
             -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
             -H "Accept-Language: en-US,en;q=0.9" \
             -H "Referer: https://www.support.xerox.com/" \
             -b "agree=true; xerox_eula_accepted=true; license_agreed=true" \
-            "$DRIVER_URL" -o downloaded_driver
+            "$DRIVER_URL" -o downloaded_driver; then
+              echo "Error: Download failed! Check if DRIVER_URL is valid and reachable."
+              exit 1
+          fi
 
           FILE_TYPE=$(file downloaded_driver)
 
-          # Validate if the download returned HTML instead of a binary file
+          # Validate binary format
           if [[ "$FILE_TYPE" == *"HTML document"* ]] || [[ "$FILE_TYPE" == *"ASCII text"* ]]; then
-            echo "Error: Downloaded file is an HTML landing page instead of a binary installer!"
-            echo "Inspecting preview of downloaded payload:"
+            echo "Error: Downloaded payload returned HTML/Text instead of a binary installer!"
+            echo "Payload Preview:"
             head -n 20 downloaded_driver
             exit 1
           fi
