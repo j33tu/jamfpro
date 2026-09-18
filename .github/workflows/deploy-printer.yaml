@@ -110,17 +110,47 @@ jobs:
             mv downloaded_driver driver.pkg
           fi
 
-      - name: Install PKG & Extract PPD
+      - name: Install PKG, Map Printer Queue & Extract PPD
         id: ppd
         run: |
+          echo "Installing PKG on runner..."
           sudo installer -pkg ./driver.pkg -target /
 
-          PPD_PATH=$(find /Library/Printers/PPDs/Contents/Resources -name "*.ppd" | head -n 1)
-          if [ -z "$PPD_PATH" ]; then
-            echo "Error: PPD file not found after package installation!" && exit 1
+          echo "Searching for installed driver template/PPD..."
+          DRIVER_PPD=$(find /Library/Printers/PPDs/Contents/Resources /usr/share/cups/model -name "*.gz" -o -name "*.ppd" 2>/dev/null | grep -i "B1025\|B1022\|Xerox" | head -n 1)
+
+          if [ -z "$DRIVER_PPD" ]; then
+            echo "Warning: Specific driver template not found, falling back to top PPD file..."
+            DRIVER_PPD=$(find /Library/Printers/PPDs/Contents/Resources -type f | head -n 1)
           fi
 
-          cp "$PPD_PATH" ./printer.ppd
+          if [ -z "$DRIVER_PPD" ]; then
+            echo "Error: No driver template found after installing PKG!" && exit 1
+          fi
+
+          echo "Found driver template at: $DRIVER_PPD"
+
+          TEMP_QUEUE="Temp_Jamf_Printer"
+
+          echo "Mapping printer queue on runner via lpadmin..."
+          sudo lpadmin -p "$TEMP_QUEUE" \
+            -E \
+            -v "lpd://${{ needs.parse_config.outputs.printer_ip }}" \
+            -m "$DRIVER_PPD"
+
+          GENERATED_PPD="/etc/cups/ppd/${TEMP_QUEUE}.ppd"
+
+          if [ ! -f "$GENERATED_PPD" ]; then
+            echo "Error: CUPS did not generate $GENERATED_PPD after mapping!" && exit 1
+          fi
+
+          echo "Successfully generated and mapped PPD at: $GENERATED_PPD"
+
+          sudo cp "$GENERATED_PPD" ./printer.ppd
+          sudo chmod 644 ./printer.ppd
+
+          sudo lpadmin -x "$TEMP_QUEUE"
+
           echo "ppd_found=true" >> $GITHUB_OUTPUT
 
       - name: Upload Processed Driver Artifacts
