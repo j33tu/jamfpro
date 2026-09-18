@@ -1,0 +1,9 @@
+{
+    "printer_name": "Office-HP-LaserJet",
+    "printer_ip": "192.168.1.100",
+    "driver_url": "https://drivers.company.com/hp/HP-LaserJet-v1.2.pkg",
+    "category": "Infrastructure",
+    "make_default": false,
+    "dev_target_group": "Testing-Macs-Dev",
+    "prod_target_group": "Building-A-Macs"
+}

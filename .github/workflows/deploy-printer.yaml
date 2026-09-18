@@ -1,0 +1,144 @@
+name: Deploy Printer to Jamf
+
+on:
+  push:
+    branches:
+      - code-dev
+      - code-main
+
+jobs:
+  deploy:
+    name: Deploy Printer Configuration
+    runs-on: macos-latest
+    # Dynamically binds environment secrets based on active branch
+    environment: ${{ github.ref == 'refs/heads/code-main' && 'production' || 'development' }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Parse Input JSON
+        run: |
+          CONFIG_FILE="printers/new-printer.json"
+
+          echo "PRINTER_NAME=$(jq -r '.printer_name' $CONFIG_FILE)" >> $GITHUB_ENV
+          echo "PRINTER_IP=$(jq -r '.printer_ip' $CONFIG_FILE)" >> $GITHUB_ENV
+          echo "DRIVER_URL=$(jq -r '.driver_url' $CONFIG_FILE)" >> $GITHUB_ENV
+          echo "CATEGORY=$(jq -r '.category' $CONFIG_FILE)" >> $GITHUB_ENV
+          echo "MAKE_DEFAULT=$(jq -r '.make_default' $CONFIG_FILE)" >> $GITHUB_ENV
+
+          if [ "${{ github.ref }}" == "refs/heads/code-main" ]; then
+            echo "TARGET_GROUP=$(jq -r '.prod_target_group' $CONFIG_FILE)" >> $GITHUB_ENV
+            echo "INSTANCE_TYPE=PROD" >> $GITHUB_ENV
+          else
+            echo "TARGET_GROUP=$(jq -r '.dev_target_group' $CONFIG_FILE)" >> $GITHUB_ENV
+            echo "INSTANCE_TYPE=DEV" >> $GITHUB_ENV
+          fi
+
+      - name: Download Driver & Extract PPD
+        run: |
+          echo "Downloading driver from $DRIVER_URL..."
+          curl -sSL "$DRIVER_URL" -o driver.pkg
+
+          echo "Installing driver on macOS runner to generate PPD..."
+          sudo installer -pkg driver.pkg -target /
+
+          PPD_PATH=$(find /Library/Printers/PPDs/Contents/Resources -name "*.ppd" | head -n 1)
+          if [ -z "$PPD_PATH" ]; then
+            echo "Error: No PPD file found after installing driver." && exit 1
+          fi
+          echo "Extracted PPD from: $PPD_PATH"
+          cp "$PPD_PATH" ./printer.ppd
+
+      - name: Authenticate with Jamf Pro API
+        env:
+          JAMF_URL: ${{ secrets.JAMF_URL }}
+          CLIENT_ID: ${{ secrets.JAMF_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.JAMF_CLIENT_SECRET }}
+        run: |
+          echo "Authenticating with Jamf ($INSTANCE_TYPE)..."
+          TOKEN=$(curl -s -X POST "$JAMF_URL/api/oauth/token" \
+            -u "$CLIENT_ID:$CLIENT_SECRET" \
+            -d "grant_type=client_credentials" | jq -r '.access_token')
+
+          if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
+            echo "Authentication failed!" && exit 1
+          fi
+          echo "JAMF_TOKEN=$TOKEN" >> $GITHUB_ENV
+
+      - name: Upload Package to Jamf
+        env:
+          JAMF_URL: ${{ secrets.JAMF_URL }}
+        run: |
+          echo "Uploading package driver.pkg..."
+          curl -s -X POST "$JAMF_URL/api/v1/packages" \
+            -H "Authorization: Bearer $JAMF_TOKEN" \
+            -F "file=@driver.pkg"
+
+      - name: Create Printer Object in Jamf
+        env:
+          JAMF_URL: ${{ secrets.JAMF_URL }}
+        run: |
+          PPD_CONTENT=$(cat ./printer.ppd | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+
+          PRINTER_NAME_SUFFIX="$PRINTER_NAME"
+          if [ "$INSTANCE_TYPE" == "DEV" ]; then
+            PRINTER_NAME_SUFFIX="$PRINTER_NAME [DEV]"
+          fi
+
+          PRINTER_XML="<printer>
+            <name>$PRINTER_NAME_SUFFIX</name>
+            <category>$CATEGORY</category>
+            <uri>lpd://$PRINTER_IP</uri>
+            <ppd_contents>$PPD_CONTENT</ppd_contents>
+          </printer>"
+
+          curl -s -X POST "$JAMF_URL/JSSResource/printers/id/0" \
+            -H "Authorization: Bearer $JAMF_TOKEN" \
+            -H "Content-Type: application/xml" \
+            -d "$PRINTER_XML"
+
+      - name: Create & Assign Deployment Policy
+        env:
+          JAMF_URL: ${{ secrets.JAMF_URL }}
+        run: |
+          POLICY_NAME="Install Printer - $PRINTER_NAME"
+          if [ "$INSTANCE_TYPE" == "DEV" ]; then
+            POLICY_NAME="Install Printer - $PRINTER_NAME [DEV]"
+          fi
+
+          POLICY_XML="<policy>
+            <general>
+              <name>$POLICY_NAME</name>
+              <enabled>true</enabled>
+              <trigger_checkin>true</trigger_checkin>
+              <frequency>Once per computer</frequency>
+            </general>
+            <scope>
+              <computer_groups>
+                <computer_group>
+                  <name>$TARGET_GROUP</name>
+                </computer_group>
+              </computer_groups>
+            </scope>
+            <package_configuration>
+              <packages>
+                <package>
+                  <name>driver.pkg</name>
+                  <action>Install</action>
+                </package>
+              </packages>
+            </package_configuration>
+            <printers>
+              <printer>
+                <name>$PRINTER_NAME</name>
+                <action>install</action>
+                <make_default>$MAKE_DEFAULT</make_default>
+              </printer>
+            </printers>
+          </policy>"
+
+          curl -s -X POST "$JAMF_URL/JSSResource/policies/id/0" \
+            -H "Authorization: Bearer $JAMF_TOKEN" \
+            -H "Content-Type: application/xml" \
+            -d "$POLICY_XML"
