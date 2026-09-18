@@ -10,14 +10,14 @@ jobs:
   deploy:
     name: Deploy Printer Configuration
     runs-on: macos-latest
-    # Binds Jamf secrets based on active branch (development vs production)
+    # Dynamically select 'development' environment for code-dev and 'production' for code-main
     environment: ${{ github.ref == 'refs/heads/code-main' && 'production' || 'development' }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Parse Input JSON
+      - name: Parse Input JSON File
         run: |
           CONFIG_FILE="printers/new-printer.json"
 
@@ -31,7 +31,7 @@ jobs:
           echo "CATEGORY=$(jq -r '.category' $CONFIG_FILE)" >> $GITHUB_ENV
           echo "MAKE_DEFAULT=$(jq -r '.make_default' $CONFIG_FILE)" >> $GITHUB_ENV
 
-          # Select Target Group & Instance Name based on branch
+          # Set target computer group and instance suffix based on branch
           if [ "${{ github.ref }}" == "refs/heads/code-main" ]; then
             echo "TARGET_GROUP=$(jq -r '.prod_target_group' $CONFIG_FILE)" >> $GITHUB_ENV
             echo "INSTANCE_TYPE=PROD" >> $GITHUB_ENV
@@ -43,21 +43,33 @@ jobs:
       - name: Download Driver (.pkg or .dmg) & Extract PPD
         run: |
           echo "Downloading driver payload from $DRIVER_URL..."
-          curl -sSL "$DRIVER_URL" -o downloaded_driver
+
+          # Download using custom User-Agent and headers to bypass vendor CDN landing pages
+          curl -sSL \
+            -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept-Language: en-US,en;q=0.9" \
+            "$DRIVER_URL" -o downloaded_driver
 
           FILE_TYPE=$(file downloaded_driver)
 
-          # Handle DMG vs PKG extraction
+          # Validate if the download returned HTML instead of a binary file
+          if [[ "$FILE_TYPE" == *"HTML document"* ]] || [[ "$FILE_TYPE" == *"ASCII text"* ]]; then
+            echo "Error: Downloaded file is an HTML landing page instead of a binary installer!"
+            echo "Ensure driver_url in printers/new-printer.json points directly to the .dmg or .pkg payload."
+            exit 1
+          fi
+
+          # Handle DMG vs direct PKG extraction
           if [[ "$FILE_TYPE" == *"zlib compressed"* ]] || [[ "$DRIVER_URL" == *.dmg ]]; then
             echo "Detected DMG disk image. Mounting..."
             mv downloaded_driver driver.dmg
             
             MOUNT_DIR=$(hdiutil attach driver.dmg -nobrowse | grep /Volumes | awk -F'\t' '{print $NF}')
-            echo "Mounted at: $MOUNT_DIR"
+            echo "Mounted DMG at: $MOUNT_DIR"
 
             PKG_INSIDE=$(find "$MOUNT_DIR" -maxdepth 2 -name "*.pkg" | head -n 1)
             if [ -z "$PKG_INSIDE" ]; then
-              echo "Error: Could not find .pkg inside DMG!"
+              echo "Error: Could not locate .pkg file inside mounted DMG!"
               hdiutil detach "$MOUNT_DIR"
               exit 1
             fi
@@ -70,14 +82,14 @@ jobs:
             mv downloaded_driver driver.pkg
           fi
 
-          # Install PKG on runner to generate PPD file
+          # Install PKG locally on macOS runner to generate PPD file
           echo "Installing PKG on runner..."
           sudo installer -pkg ./driver.pkg -target /
 
-          # Locate generated PPD
+          # Locate generated PPD file in system directory
           PPD_PATH=$(find /Library/Printers/PPDs/Contents/Resources -name "*.ppd" | head -n 1)
           if [ -z "$PPD_PATH" ]; then
-            echo "Error: Could not locate generated PPD file!" && exit 1
+            echo "Error: Could not locate generated PPD file after driver installation!" && exit 1
           fi
 
           echo "Extracted PPD from: $PPD_PATH"
@@ -95,7 +107,7 @@ jobs:
             -d "grant_type=client_credentials" | jq -r '.access_token')
 
           if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
-            echo "Authentication failed!" && exit 1
+            echo "Authentication failed! Check JAMF_URL, JAMF_CLIENT_ID, and JAMF_CLIENT_SECRET." && exit 1
           fi
 
           echo "JAMF_TOKEN=$TOKEN" >> $GITHUB_ENV
